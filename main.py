@@ -1,0 +1,391 @@
+"""
+Main orchestrator for the Google Search Web Scraper.
+
+Reads input CSV, generates keyword-location combinations, scrapes Google,
+visits websites, extracts data via AI, and writes results to CSV.
+
+Supports multi-threaded execution (--workers N) with crash-safe resume.
+Progress is tracked per work-unit (keyword + location + page), so the
+number of workers can change between runs without losing progress.
+"""
+import argparse
+import csv
+import multiprocessing
+import os
+import random
+import signal
+import subprocess
+import sys
+import time
+import logging
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import product
+
+import config
+from config import setup_logging
+from url_generator import generate_all_search_urls
+from google_scraper import load_proxies, scrape_google_page
+from website_extractor import extract_website_content
+from ai_extractor import extract_business_data
+from progress_tracker import ProgressTracker
+
+# Thread lock for CSV writes
+_csv_lock = threading.Lock()
+
+# Event set on Ctrl+C — workers check before starting new work
+_shutdown_event = threading.Event()
+
+
+def read_input_csv(filepath: str) -> tuple:
+    """
+    Read input CSV with 'keywords' and 'locations' columns.
+
+    Returns:
+        Tuple of (keywords_list, locations_list).
+    """
+    keywords = []
+    locations = []
+    with open(filepath, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            kw = row.get("keywords", "").strip()
+            loc = row.get("locations", "").strip()
+            if kw and kw not in keywords:
+                keywords.append(kw)
+            if loc and loc not in locations:
+                locations.append(loc)
+    return keywords, locations
+
+
+def generate_combinations(keywords: list, locations: list) -> list:
+    """
+    Generate cartesian product of keywords and locations.
+
+    Order: keyword1+location1, keyword1+location2, ..., keyword2+location1, ...
+
+    Returns:
+        List of (keyword, location) tuples.
+    """
+    return list(product(keywords, locations))
+
+
+def initialize_output_csv(filepath: str):
+    """Create output CSV with headers if it doesn't exist."""
+    if not os.path.exists(filepath):
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=config.OUTPUT_HEADERS)
+            writer.writeheader()
+
+
+def append_to_output_csv(filepath: str, data: dict, keyword: str, location: str, page: int):
+    """
+    Append a single record to the output CSV immediately (thread-safe).
+
+    This ensures no data loss if the scraper crashes.
+    """
+    row = {
+        "keyword": keyword,
+        "location": location,
+        "google_page": page + 1,  # 1-based page number for display
+        "business_name": data.get("business_name", ""),
+        "website_url": data.get("website_url", ""),
+        "business_description": data.get("business_description", ""),
+        "services_offered": data.get("services_offered", ""),
+        "contact_phone": data.get("contact_phone", ""),
+        "contact_email": data.get("contact_email", ""),
+        "address": data.get("address", ""),
+        "business_city": data.get("business_city", ""),
+        "business_state": data.get("business_state", ""),
+        "logo_url": data.get("logo_url", ""),
+    }
+    with _csv_lock:
+        with open(filepath, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=config.OUTPUT_HEADERS)
+            writer.writerow(row)
+
+
+def process_website(url, keyword, location, page, proxies, tracker, logger):
+    """Process a single website: extract content, run AI, save result."""
+    if tracker.is_url_processed(url):
+        logger.info(f"Skipping already processed URL: {url}")
+        return
+
+    if _shutdown_event.is_set():
+        return
+
+    logger.info(f"Processing website: {url}")
+
+    # Step 1: Extract website content (homepage, contact page, logo)
+    content = extract_website_content(url, proxies)
+
+    # Step 2: Send to AI for extraction
+    business_data = extract_business_data(
+        homepage_html=content["homepage_html"],
+        contact_html=content["contact_html"],
+        logo_url=content["logo_url"],
+        website_url=url,
+    )
+
+    # Step 3: Immediately append to output CSV (thread-safe)
+    append_to_output_csv(config.OUTPUT_CSV, business_data, keyword, location, page)
+
+    # Step 4: Mark URL as processed
+    tracker.mark_url_processed(url)
+
+    logger.info(f"Completed: {business_data.get('business_name', 'Unknown')} - {url}")
+
+    # Rate limiting between website visits
+    time.sleep(random.uniform(config.REQUEST_DELAY_MIN, config.REQUEST_DELAY_MAX))
+
+
+
+
+
+def worker_process_combo(keyword, location, page_idx, search_url, proxies, tracker, logger):
+    """
+    Worker function: scrape one Google page and process all URLs found.
+
+    This is the unit of work submitted to the thread pool.
+    Each call handles one (keyword, location, page) combination.
+    """
+    if _shutdown_event.is_set():
+        return f"SHUTDOWN: {keyword} | {location} | page {page_idx + 1}"
+
+    # Check if this combo was already completed in a previous run
+    if tracker.is_combo_completed(keyword, location, page_idx):
+        return f"SKIP (done): {keyword} | {location} | page {page_idx + 1}"
+
+    label = f"'{keyword}' + '{location}' page {page_idx + 1}"
+    logger.info(f"[Worker] Starting: {label}")
+
+    # Clear previous failure flag if retrying
+    tracker.clear_failed_combo(keyword, location, page_idx)
+
+    # Scrape Google results page
+    try:
+        scrape_result = scrape_google_page(search_url, proxies)
+    except Exception as e:
+        logger.error(
+            f"CRASH in scrape_google_page for {label}: "
+            f"{type(e).__name__}: {e}"
+        )
+        logger.error(traceback.format_exc())
+        scrape_result = {"urls": [], "status": "error"}
+        time.sleep(5)
+
+    status = scrape_result.get("status", "empty")
+    website_urls = scrape_result.get("urls", [])
+
+    if not website_urls:
+        if status == "blocked":
+            # Google blocked us on all retries — mark as FAILED, not done.
+            # This combo will be retried on the next run.
+            logger.warning(
+                f"[Worker] BLOCKED for {label} — marked as failed (will retry next run)"
+            )
+            tracker.mark_combo_failed(keyword, location, page_idx)
+            return f"BLOCKED: {label}"
+        else:
+            # Genuinely no results (empty page or error) — mark done
+            logger.info(f"[Worker] No results for {label}, marking done.")
+            tracker.mark_combo_completed(keyword, location, page_idx)
+            return f"NO RESULTS: {label}"
+
+    # Process each website found on this Google page
+    for url in website_urls:
+        if _shutdown_event.is_set():
+            # Don't mark combo as completed — we'll resume these URLs
+            return f"SHUTDOWN mid-combo: {label}"
+        try:
+            process_website(
+                url, keyword, location, page_idx, proxies, tracker, logger
+            )
+        except Exception as e:
+            logger.error(
+                f"CRASH in process_website for {url}: "
+                f"{type(e).__name__}: {e}"
+            )
+            logger.error(traceback.format_exc())
+            tracker.mark_url_processed(url)
+
+    # All URLs on this page done — mark combo complete
+    tracker.mark_combo_completed(keyword, location, page_idx)
+    logger.info(f"[Worker] Completed: {label}")
+    return f"DONE: {label}"
+
+
+def main():
+    """Main entry point for the scraper."""
+    # Parse CLI arguments
+    parser = argparse.ArgumentParser(description="Google Search Web Scraper")
+    parser.add_argument(
+        "--workers", type=int, default=config.NUM_WORKERS,
+        help=f"Number of concurrent worker threads (default: {config.NUM_WORKERS})",
+    )
+    args = parser.parse_args()
+    num_workers = max(1, args.workers)
+
+    logger = setup_logging()
+    logger.info("=" * 60)
+    logger.info(f"Google Search Web Scraper - Starting ({num_workers} workers)")
+    logger.info("=" * 60)
+
+    # Load proxies
+    proxies = load_proxies()
+    if not proxies:
+        logger.warning("No proxies loaded! Scraping without proxies.")
+    else:
+        logger.info(f"Loaded {len(proxies)} proxies")
+
+    # Read input CSV
+    if not os.path.exists(config.INPUT_CSV):
+        logger.error(f"Input file not found: {config.INPUT_CSV}")
+        print(f"ERROR: Please create '{config.INPUT_CSV}' with 'keywords' and 'locations' columns.")
+        return
+
+    keywords, locations = read_input_csv(config.INPUT_CSV)
+    logger.info(f"Loaded {len(keywords)} keywords and {len(locations)} locations")
+
+    # Generate all combinations
+    combinations = generate_combinations(keywords, locations)
+    total_combos = len(combinations)
+    logger.info(f"Total keyword-location combinations: {total_combos}")
+
+    if total_combos == 0:
+        logger.error("No valid keyword-location combinations found.")
+        return
+
+    # Initialize output CSV and progress tracker
+    initialize_output_csv(config.OUTPUT_CSV)
+    tracker = ProgressTracker()
+
+    # Count totals and build pending list
+    max_pages = config.MAX_GOOGLE_PAGES
+    total_work = total_combos * max_pages
+    logger.info(f"Total work units: {total_work} ({total_combos} combos × {max_pages} pages)")
+
+    # Build pending list — only generate URLs for combos with pending pages
+    pending = []
+    already_done = 0
+    retrying_failed = 0
+    for keyword, location in combinations:
+        # Quick check: are ALL pages for this combo done?
+        combo_pending_pages = []
+        for page_idx in range(max_pages):
+            if tracker.is_combo_completed(keyword, location, page_idx):
+                already_done += 1
+            else:
+                combo_pending_pages.append(page_idx)
+                if tracker.is_combo_failed(keyword, location, page_idx):
+                    retrying_failed += 1
+
+        if combo_pending_pages:
+            # Only generate URLs once per (keyword, location)
+            search_urls = generate_all_search_urls(keyword, location, max_pages=max_pages)
+            for page_idx in combo_pending_pages:
+                pending.append((keyword, location, page_idx, search_urls[page_idx]))
+
+    logger.info(
+        f"Already completed: {already_done}, pending: {len(pending)} "
+        f"(including {retrying_failed} previously-failed combos to retry)"
+    )
+
+    if not pending:
+        logger.info("All work already completed! Nothing to do.")
+        return
+
+    # Install Ctrl+C handler
+    original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _signal_handler(signum, frame):
+        if _shutdown_event.is_set():
+            # Second Ctrl+C — force exit
+            logger.warning("Force shutdown requested!")
+            sys.exit(1)
+        logger.warning("Shutdown requested (Ctrl+C). Finishing in-flight work...")
+        print("\nShutting down gracefully... (press Ctrl+C again to force)")
+        _shutdown_event.set()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    # Submit work to thread pool
+    completed_count = already_done
+    failed_count = 0
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="scraper") as executor:
+            future_to_wu = {}
+            for wu in pending:
+                keyword, location, page_idx, search_url = wu
+                future = executor.submit(
+                    worker_process_combo,
+                    keyword, location, page_idx, search_url,
+                    proxies, tracker, logger,
+                )
+                future_to_wu[future] = wu
+
+            for future in as_completed(future_to_wu):
+                wu = future_to_wu[future]
+                try:
+                    result = future.result()
+                    if result and result.startswith("DONE"):
+                        completed_count += 1
+                    elif result and result.startswith("SKIP"):
+                        completed_count += 1
+                    elif result and result.startswith("NO RESULTS"):
+                        completed_count += 1
+                    elif result and result.startswith("BLOCKED"):
+                        failed_count += 1
+                    logger.info(
+                        f"[Progress] {completed_count}/{total_work} done, "
+                        f"{failed_count} blocked — {result}"
+                    )
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(
+                        f"Worker raised exception for {wu[0]}|{wu[1]}|p{wu[2]}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+                if _shutdown_event.is_set():
+                    logger.info("Cancelling remaining futures...")
+                    for f in future_to_wu:
+                        f.cancel()
+                    break
+    finally:
+        # Ensure progress is flushed to disk
+        tracker.flush()
+        signal.signal(signal.SIGINT, original_sigint)
+
+    logger.info("=" * 60)
+    if _shutdown_event.is_set():
+        logger.info(
+            f"Scraper stopped by user. Progress saved. "
+            f"Completed {completed_count}/{total_work} combos."
+        )
+    else:
+        logger.info("Scraping complete! Results saved to: " + config.OUTPUT_CSV)
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nScraper stopped by user. Progress saved.")
+    except Exception as e:
+        # Last-resort crash logging
+        logging.basicConfig(level=logging.ERROR)
+        logging.error(f"FATAL CRASH: {type(e).__name__}: {e}")
+        logging.error(traceback.format_exc())
+        # Also write to a crash file for post-mortem
+        with open("crash.log", "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"FATAL CRASH at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(traceback.format_exc())
+            f.write(f"{'='*60}\n")
+        print(f"FATAL CRASH: {e} — see crash.log for details")
+

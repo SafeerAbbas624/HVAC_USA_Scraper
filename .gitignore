@@ -1,0 +1,27 @@
+# Environment / secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data / output
+output.csv
+progress.json
+scraper.log
+crash.log
+downloaded_files/
+
+# Proxies (contains credentials)
+proxies.txt
+
+# Test / debug artifacts
+test_*
+debug_*
+get-pip.py
+
+# OS
+Thumbs.db
+.DS_Store
