@@ -28,6 +28,7 @@ class ProgressTracker:
     Tracked state:
         - completed_combos : set of "keyword||location||page" strings
         - processed_urls   : set of website URLs already fully processed
+        - processed_domains: set of domains already processed (one business = one domain)
         - failed_combos    : set of combos that failed (blocked/error) — retried next run
     """
 
@@ -43,12 +44,26 @@ class ProgressTracker:
             "completed_combos": set(),
             "processed_urls": set(),
             "failed_combos": set(),
+            "processed_domains": set(),
         }
         self._load()
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extract the root domain from a URL (strips www.)."""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            return domain
+        except Exception:
+            return url
 
     def _load(self):
         """Load progress from disk, migrating old format if necessary."""
@@ -70,6 +85,7 @@ class ProgressTracker:
             self.state["processed_urls"] = set(saved.get("processed_urls", []))
             self.state["completed_combos"] = set()
             self.state["failed_combos"] = set()
+            self.state["processed_domains"] = set()
             self._force_save()
             return
 
@@ -77,9 +93,11 @@ class ProgressTracker:
         self.state["completed_combos"] = set(saved.get("completed_combos", []))
         self.state["processed_urls"] = set(saved.get("processed_urls", []))
         self.state["failed_combos"] = set(saved.get("failed_combos", []))
+        self.state["processed_domains"] = set(saved.get("processed_domains", []))
         logger.info(
             f"Resumed progress: completed_combos={len(self.state['completed_combos'])}, "
             f"processed_urls={len(self.state['processed_urls'])}, "
+            f"processed_domains={len(self.state['processed_domains'])}, "
             f"failed_combos={len(self.state['failed_combos'])}"
         )
 
@@ -99,6 +117,7 @@ class ProgressTracker:
                 "completed_combos": sorted(self.state["completed_combos"]),
                 "processed_urls": sorted(self.state["processed_urls"]),
                 "failed_combos": sorted(self.state["failed_combos"]),
+                "processed_domains": sorted(self.state["processed_domains"]),
             }
             dir_name = os.path.dirname(self.filepath) or "."
             fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -157,12 +176,59 @@ class ProgressTracker:
         with self._lock:
             return url in self.state["processed_urls"]
 
+    def claim_url(self, url: str) -> bool:
+        """
+        Atomically check-and-claim a URL for processing.
+
+        Returns True if this thread successfully claimed the URL (first caller).
+        Returns False if the URL was already processed or claimed by another thread.
+
+        This eliminates the race condition where two threads both see
+        is_url_processed()=False and both proceed to call AI.
+        """
+        with self._lock:
+            if url in self.state["processed_urls"]:
+                return False
+            # Mark immediately so no other thread can claim it
+            self.state["processed_urls"].add(url)
+            self._dirty = True
+            self._save_if_needed()
+            return True
+
     def mark_url_processed(self, url: str):
         """Mark a website URL as fully processed and persist."""
         with self._lock:
             self.state["processed_urls"].add(url)
             self._dirty = True
             self._save_if_needed()
+
+    def claim_domain(self, url: str) -> bool:
+        """
+        Atomically check-and-claim a domain for processing.
+
+        Returns True if this thread is the first to claim this domain.
+        Returns False if the domain was already processed by any URL.
+
+        This prevents duplicate AI calls + CSV rows when Google returns
+        different pages of the same website (e.g. example.com/services
+        and example.com/about from different search pages).
+        """
+        domain = self._extract_domain(url)
+        if not domain:
+            return True  # can't extract domain, allow processing
+        with self._lock:
+            if domain in self.state["processed_domains"]:
+                return False
+            self.state["processed_domains"].add(domain)
+            self._dirty = True
+            self._save_if_needed()
+            return True
+
+    def is_domain_processed(self, url: str) -> bool:
+        """Check if a domain has already been processed."""
+        domain = self._extract_domain(url)
+        with self._lock:
+            return domain in self.state["processed_domains"]
 
     def mark_combo_failed(self, keyword: str, location: str, page: int):
         """

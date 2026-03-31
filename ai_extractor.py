@@ -7,7 +7,9 @@ Automatically switches to the next provider when rate limits are hit.
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import warnings
@@ -109,6 +111,50 @@ def _mark_success(idx):
 
 _cache_lock = threading.Lock()
 _content_cache = {}  # md5 hash -> extracted dict (deduplicates identical pages)
+_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_cache.json")
+_cache_dirty = False
+
+
+def _load_content_cache():
+    """Load content cache from disk at startup."""
+    global _content_cache
+    if os.path.exists(_CACHE_FILE):
+        try:
+            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                _content_cache = json.load(f)
+            logger.info(f"Loaded {len(_content_cache)} cached AI results from disk")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not load content cache: {e}")
+            _content_cache = {}
+
+
+def save_content_cache():
+    """Persist content cache to disk atomically (call on shutdown or periodically)."""
+    global _cache_dirty
+    with _cache_lock:
+        if not _cache_dirty:
+            return
+        cache_copy = dict(_content_cache)
+        _cache_dirty = False
+    try:
+        dir_name = os.path.dirname(_CACHE_FILE) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cache_copy, f)
+            os.replace(tmp_path, _CACHE_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except IOError as e:
+        logger.error(f"Failed to save content cache: {e}")
+
+
+# Load cache on module import
+_load_content_cache()
 
 JUNK_PATTERNS = [
     "domain for sale", "this domain", "buy this domain",
@@ -393,9 +439,10 @@ def extract_business_data(
             if not extracted.get("logo_url"):
                 extracted["logo_url"] = logo_url
 
-            # Cache result for content deduplication
+            # Cache result for content deduplication (persisted to disk)
             with _cache_lock:
                 _content_cache[content_key] = extracted.copy()
+                _cache_dirty = True
 
             logger.info(f"[{provider['name']}] Successfully extracted data for {website_url}")
             _mark_success(idx)

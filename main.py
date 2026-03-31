@@ -28,7 +28,7 @@ from config import setup_logging
 from url_generator import generate_all_search_urls
 from google_scraper import load_proxies, scrape_google_page
 from website_extractor import extract_website_content
-from ai_extractor import extract_business_data
+from ai_extractor import extract_business_data, save_content_cache
 from progress_tracker import ProgressTracker
 
 # Thread lock for CSV writes
@@ -108,8 +108,17 @@ def append_to_output_csv(filepath: str, data: dict, keyword: str, location: str,
 
 def process_website(url, keyword, location, page, proxies, tracker, logger):
     """Process a single website: extract content, run AI, save result."""
-    if tracker.is_url_processed(url):
-        logger.info(f"Skipping already processed URL: {url}")
+    # Domain-level dedup — one domain = one business.
+    # If Google returned example.com/services on page 1 and
+    # example.com/about on page 3, only the first one gets processed.
+    # This saves AI tokens and prevents duplicate CSV rows.
+    if not tracker.claim_domain(url):
+        logger.info(f"Skipping already processed domain: {url}")
+        return
+
+    # URL-level claim (still needed for exact-URL dedup within same domain claim)
+    if not tracker.claim_url(url):
+        logger.info(f"Skipping already claimed/processed URL: {url}")
         return
 
     if _shutdown_event.is_set():
@@ -355,8 +364,9 @@ def main():
                         f.cancel()
                     break
     finally:
-        # Ensure progress is flushed to disk
+        # Ensure progress and AI content cache are flushed to disk
         tracker.flush()
+        save_content_cache()
         signal.signal(signal.SIGINT, original_sigint)
 
     logger.info("=" * 60)

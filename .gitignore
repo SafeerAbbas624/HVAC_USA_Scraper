@@ -10,6 +10,7 @@ __pycache__/
 # Data / output
 output.csv
 progress.json
+content_cache.json
 scraper.log
 crash.log
 downloaded_files/
