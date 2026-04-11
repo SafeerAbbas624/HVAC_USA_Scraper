@@ -96,14 +96,34 @@ def is_excluded_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
+        path = parsed.path.lower()
+
         # Remove 'www.' prefix for matching
         if domain.startswith("www."):
             domain = domain[4:]
 
-        # Exclude non-US country TLDs (we target US businesses)
-        non_us_tlds = (".ca", ".uk", ".co.uk", ".au", ".in", ".de", ".fr", ".mx")
+        # Exclude non-US country TLDs (we target US businesses only)
+        non_us_tlds = (
+            ".ca", ".uk", ".co.uk", ".au", ".in", ".de", ".fr", ".mx",
+            ".es", ".it", ".nl", ".pt", ".pl", ".se", ".no", ".dk", ".fi",
+            ".ch", ".at", ".be", ".br", ".ar", ".cl", ".co", ".pe", ".ve",
+            ".nz", ".co.nz", ".za", ".co.za", ".sg", ".hk", ".jp", ".cn",
+            ".kr", ".ru", ".tr", ".sa", ".ae", ".pk", ".ng", ".gh", ".ke",
+            ".ie", ".cz", ".sk", ".hu", ".ro", ".bg", ".rs", ".hr", ".si",
+        )
         for tld in non_us_tlds:
             if domain.endswith(tld):
+                return True
+
+        # Exclude URLs with foreign language path segments
+        # e.g. /de/, /es/, /fr/, /sv-se/ etc.
+        foreign_path_segments = (
+            "/de/", "/es/", "/fr/", "/it/", "/nl/", "/pt/", "/pl/",
+            "/sv-se/", "/de-de/", "/es-es/", "/fr-fr/", "/en-gb/",
+            "/en-au/", "/en-ca/", "/en-in/",
+        )
+        for seg in foreign_path_segments:
+            if path.startswith(seg) or f"{seg}" in path:
                 return True
 
         for excluded in config.EXCLUDED_DOMAINS:
@@ -190,16 +210,36 @@ def _extract_urls_from_page(sb) -> list:
     except Exception:
         pass
 
-    # --- Strategy 5: last resort — all links in #rso ---
-    if not found_urls:
-        try:
-            elems = sb.find_elements("css selector", "#rso a[href]")
-            for elem in elems:
-                href = elem.get_attribute("href")
-                if href and href.startswith("http"):
-                    _add_url(found_urls, href)
-        except Exception:
-            pass
+    # --- Strategy 5: Google 2025/2026 layout — jsname / data-ved anchors ---
+    try:
+        elems = sb.find_elements("css selector", "#rso a[jsname][href], #rso a[data-ved][href]")
+        for elem in elems:
+            href = elem.get_attribute("href")
+            _add_url(found_urls, href)
+    except Exception:
+        pass
+
+    # --- Strategy 6: Always-on broad sweep of ALL links in #rso ---
+    # Runs regardless of other strategies to catch any missed results.
+    # Filters out Google-internal URLs automatically via is_excluded_url.
+    try:
+        elems = sb.find_elements("css selector", "#rso a[href]")
+        for elem in elems:
+            href = elem.get_attribute("href")
+            if href and href.startswith("http") and "google.com" not in href:
+                _add_url(found_urls, href)
+    except Exception:
+        pass
+
+    # --- Strategy 7: search-wide sweep as final safety net ---
+    try:
+        elems = sb.find_elements("css selector", "div#search a[href]")
+        for elem in elems:
+            href = elem.get_attribute("href")
+            if href and href.startswith("http") and "google.com" not in href:
+                _add_url(found_urls, href)
+    except Exception:
+        pass
 
     return found_urls
 
@@ -260,8 +300,7 @@ def _scrape_worker(search_url: str, proxy_str: str, result_queue):
     try:
         sb_kwargs = {
             "uc": True,
-            "headless": True,
-            "page_load_strategy": "eager",
+            "headless2": False,
         }
 
         if proxy_str:
@@ -284,7 +323,15 @@ def _scrape_worker(search_url: str, proxy_str: str, result_queue):
 
             time.sleep(random.uniform(3, 5))
 
-            # Check for Google block *before* waiting for selectors
+            # Try to solve CAPTCHA if Google shows one
+            if _detect_google_block(sb):
+                try:
+                    sb.uc_gui_click_captcha()
+                    time.sleep(random.uniform(3, 5))
+                except Exception:
+                    pass
+
+            # Check again after CAPTCHA attempt
             if _detect_google_block(sb):
                 result["blocked"] = True
                 result_queue.put(result)

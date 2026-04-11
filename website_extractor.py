@@ -14,7 +14,6 @@ import requests
 import urllib3
 
 import config
-from google_scraper import get_random_proxy
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", message="Unverified HTTPS")
@@ -28,8 +27,8 @@ _USER_AGENT = (
 )
 
 
-def _build_session(proxy: dict) -> requests.Session:
-    """Build a requests.Session with proxy + headers."""
+def _build_session() -> requests.Session:
+    """Build a requests.Session with headers."""
     s = requests.Session()
     s.headers.update({
         "User-Agent": _USER_AGENT,
@@ -37,12 +36,6 @@ def _build_session(proxy: dict) -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
     })
     s.verify = False  # some biz sites have bad certs
-    if proxy:
-        proxy_url = (
-            f"http://{proxy['username']}:{proxy['password']}"
-            f"@{proxy['ip']}:{proxy['port']}"
-        )
-        s.proxies = {"http": proxy_url, "https": proxy_url}
     return s
 
 
@@ -101,7 +94,7 @@ def try_contact_page(session: requests.Session, base_url: str, timeout: int) -> 
     return ""
 
 
-def extract_website_content(url: str, proxies: list) -> dict:
+def extract_website_content(url: str) -> dict:
     """
     Visit a website and extract homepage HTML, contact page HTML, and logo URL.
 
@@ -113,10 +106,9 @@ def extract_website_content(url: str, proxies: list) -> dict:
         "logo_url": "",
     }
 
-    proxy = get_random_proxy(proxies)
     timeout = config.WEBSITE_VISIT_TIMEOUT  # per-request timeout
 
-    session = _build_session(proxy)
+    session = _build_session()
 
     # ---------- Homepage ----------
     logger.info(f"Visiting website: {url}")

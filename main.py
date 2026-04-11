@@ -47,7 +47,7 @@ def read_input_csv(filepath: str) -> tuple:
     """
     keywords = []
     locations = []
-    with open(filepath, "r", encoding="utf-8-sig") as f:
+    with open(filepath, "r", encoding="latin-1") as f:
         reader = csv.DictReader(f)
         for row in reader:
             kw = row.get("keywords", "").strip()
@@ -127,7 +127,7 @@ def process_website(url, keyword, location, page, proxies, tracker, logger):
     logger.info(f"Processing website: {url}")
 
     # Step 1: Extract website content (homepage, contact page, logo)
-    content = extract_website_content(url, proxies)
+    content = extract_website_content(url)
 
     # Step 2: Send to AI for extraction
     business_data = extract_business_data(
@@ -241,6 +241,26 @@ def main():
     logger.info(f"Google Search Web Scraper - Starting ({num_workers} workers)")
     logger.info("=" * 60)
 
+    # Kill only orphaned Chrome/Chromedriver processes left by a previous HVAC run.
+    # Orphaned = parent PID is 1 (systemd/init), meaning their parent already died.
+    # This avoids killing Chrome processes belonging to other apps on this server.
+    try:
+        result = subprocess.run(
+            ["bash", "-c",
+             "ps -eo ppid,pid,comm | awk '$1==1 && ($3~/chrome/ || $3~/chromedriver/) {print $2}'"],
+            capture_output=True, text=True,
+        )
+        killed_count = 0
+        for pid_str in result.stdout.strip().split("\n"):
+            pid_str = pid_str.strip()
+            if pid_str:
+                subprocess.run(["kill", "-9", pid_str], capture_output=True)
+                killed_count += 1
+        if killed_count:
+            logger.info(f"Killed {killed_count} orphaned Chrome processes from previous run")
+    except Exception as e:
+        logger.warning(f"Could not clean orphaned Chrome processes: {e}")
+
     # Load proxies
     proxies = load_proxies()
     if not proxies:
@@ -270,47 +290,20 @@ def main():
     initialize_output_csv(config.OUTPUT_CSV)
     tracker = ProgressTracker()
 
-    # Count totals and build pending list
     max_pages = config.MAX_GOOGLE_PAGES
     total_work = total_combos * max_pages
     logger.info(f"Total work units: {total_work} ({total_combos} combos × {max_pages} pages)")
 
-    # Build pending list — only generate URLs for combos with pending pages
-    pending = []
-    already_done = 0
-    retrying_failed = 0
-    for keyword, location in combinations:
-        # Quick check: are ALL pages for this combo done?
-        combo_pending_pages = []
-        for page_idx in range(max_pages):
-            if tracker.is_combo_completed(keyword, location, page_idx):
-                already_done += 1
-            else:
-                combo_pending_pages.append(page_idx)
-                if tracker.is_combo_failed(keyword, location, page_idx):
-                    retrying_failed += 1
-
-        if combo_pending_pages:
-            # Only generate URLs once per (keyword, location)
-            search_urls = generate_all_search_urls(keyword, location, max_pages=max_pages)
-            for page_idx in combo_pending_pages:
-                pending.append((keyword, location, page_idx, search_urls[page_idx]))
-
-    logger.info(
-        f"Already completed: {already_done}, pending: {len(pending)} "
-        f"(including {retrying_failed} previously-failed combos to retry)"
-    )
-
-    if not pending:
-        logger.info("All work already completed! Nothing to do.")
-        return
+    # Shuffle combinations once (1.3M items, ~100MB — fast and safe)
+    # Workers will spread across different combos immediately.
+    random.shuffle(combinations)
+    logger.info("Combinations shuffled. Starting workers...")
 
     # Install Ctrl+C handler
     original_sigint = signal.getsignal(signal.SIGINT)
 
     def _signal_handler(signum, frame):
         if _shutdown_event.is_set():
-            # Second Ctrl+C — force exit
             logger.warning("Force shutdown requested!")
             sys.exit(1)
         logger.warning("Shutdown requested (Ctrl+C). Finishing in-flight work...")
@@ -319,42 +312,78 @@ def main():
 
     signal.signal(signal.SIGINT, _signal_handler)
 
-    # Submit work to thread pool
-    completed_count = already_done
+    completed_count = 0
+    already_done = 0
     failed_count = 0
+
+    def _work_generator():
+        """Stream work units on demand — zero extra memory."""
+        for page_idx in range(max_pages):
+            for keyword, location in combinations:
+                if _shutdown_event.is_set():
+                    return
+                if tracker.is_combo_completed(keyword, location, page_idx):
+                    yield None
+                    continue
+                search_url = generate_all_search_urls(keyword, location, max_pages=max_pages)[page_idx]
+                yield (keyword, location, page_idx, search_url)
 
     try:
         with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="scraper") as executor:
             future_to_wu = {}
-            for wu in pending:
+
+            for wu in _work_generator():
+                if _shutdown_event.is_set():
+                    break
+                if wu is None:
+                    already_done += 1
+                    continue
                 keyword, location, page_idx, search_url = wu
                 future = executor.submit(
                     worker_process_combo,
                     keyword, location, page_idx, search_url,
                     proxies, tracker, logger,
                 )
-                future_to_wu[future] = wu
+                future_to_wu[future] = (keyword, location, page_idx)
+
+                # Drain completed futures to keep dict bounded
+                if len(future_to_wu) >= num_workers * 4:
+                    done_futures = [f for f in future_to_wu if f.done()]
+                    for future in done_futures:
+                        wu_done = future_to_wu.pop(future)
+                        try:
+                            result = future.result()
+                            if result and not result.startswith("BLOCKED"):
+                                completed_count += 1
+                            else:
+                                failed_count += 1
+                            logger.info(
+                                f"[Progress] {completed_count + already_done}/{total_work} done, "
+                                f"{failed_count} blocked — {result}"
+                            )
+                        except Exception as e:
+                            failed_count += 1
+                            logger.error(
+                                f"Worker exception {wu_done[0]}|{wu_done[1]}|p{wu_done[2]}: "
+                                f"{type(e).__name__}: {e}"
+                            )
 
             for future in as_completed(future_to_wu):
-                wu = future_to_wu[future]
+                wu_done = future_to_wu[future]
                 try:
                     result = future.result()
-                    if result and result.startswith("DONE"):
+                    if result and not result.startswith("BLOCKED"):
                         completed_count += 1
-                    elif result and result.startswith("SKIP"):
-                        completed_count += 1
-                    elif result and result.startswith("NO RESULTS"):
-                        completed_count += 1
-                    elif result and result.startswith("BLOCKED"):
+                    else:
                         failed_count += 1
                     logger.info(
-                        f"[Progress] {completed_count}/{total_work} done, "
+                        f"[Progress] {completed_count + already_done}/{total_work} done, "
                         f"{failed_count} blocked — {result}"
                     )
                 except Exception as e:
                     failed_count += 1
                     logger.error(
-                        f"Worker raised exception for {wu[0]}|{wu[1]}|p{wu[2]}: "
+                        f"Worker exception {wu_done[0]}|{wu_done[1]}|p{wu_done[2]}: "
                         f"{type(e).__name__}: {e}"
                     )
 

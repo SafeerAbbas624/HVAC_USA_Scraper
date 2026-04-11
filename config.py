@@ -125,7 +125,7 @@ NUM_WORKERS = 5                # Default number of concurrent worker threads
 # =============================================================================
 # Scraping Configuration
 # =============================================================================
-MAX_GOOGLE_PAGES = 50          # Total Google result pages to scrape per combination
+MAX_GOOGLE_PAGES = 5           # Total Google result pages to scrape per combination
 RESULTS_PER_PAGE = 10          # Google results per page
 PAGE_LOAD_TIMEOUT = 30         # Seconds to wait for page load
 REQUEST_DELAY_MIN = 3          # Minimum delay between requests (seconds)
