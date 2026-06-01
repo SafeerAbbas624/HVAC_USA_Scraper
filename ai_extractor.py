@@ -287,14 +287,16 @@ Return ONLY a valid JSON object with these exact keys:
     "contact_email": "Email address(es) if found",
     "address": "Full street address if found",
     "business_city": "City from the address",
-    "business_state": "2-letter US state abbreviation (e.g., NY, CA, TX)"
+    "business_state": "2-letter US state abbreviation (e.g., NY, CA, TX)",
+    "supply_location": "Comma-separated list of ALL location mentions found on the page — cities, states, zip codes, regions, service areas, and anywhere the business mentions operating, supplying, or serving"
 }
 
 Rules:
 - Return ONLY the JSON object, no markdown or extra text.
 - Use "" for fields not found. Do not invent information.
 - For business_state, always use standard 2-letter US state abbreviation.
-- Extract the ACTUAL physical location from the address on the website."""
+- Extract the ACTUAL physical location from the address on the website.
+- For supply_location, include every geographic location mentioned anywhere on the page (service area lists, 'we serve X, Y, Z', footer locations, etc.)."""
 
 
 def extract_business_data(
@@ -318,6 +320,7 @@ def extract_business_data(
         "address": "",
         "business_city": "",
         "business_state": "",
+        "supply_location": "",
         "logo_url": logo_url,
     }
 

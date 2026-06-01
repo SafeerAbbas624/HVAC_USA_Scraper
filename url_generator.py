@@ -85,6 +85,32 @@ def generate_google_maps_urls(keyword: str, location: str) -> str:
 # This builds on the core functions above without modifying them.
 # =========================================================================
 
+def generate_search_url_for_page(keyword: str, location: str, page_idx: int) -> str:
+    """
+    Build a single Google Search URL for the given (keyword, location, page_idx).
+
+    Avoids the cost of building all max_pages URLs when only one is needed.
+
+    Args:
+        keyword: The search keyword.
+        location: The location for geo-targeted results.
+        page_idx: 0-based page index (0 = first page).
+
+    Returns:
+        The Google Search URL for that page.
+    """
+    uule = encode_location_for_uule(location)
+    encoded_keyword = urllib.parse.quote_plus(keyword)
+    start = page_idx * 10
+    return (
+        f"https://www.google.com/search?"
+        f"q={encoded_keyword}"
+        f"&uule={uule}"
+        f"&start={start}"
+        f"&num=10"
+    )
+
+
 def generate_all_search_urls(keyword: str, location: str, max_pages: int = 50) -> list:
     """
     Generate Google Search URLs for pages 1 through max_pages.

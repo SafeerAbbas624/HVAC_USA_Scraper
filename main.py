@@ -10,6 +10,7 @@ number of workers can change between runs without losing progress.
 """
 import argparse
 import csv
+import gc
 import multiprocessing
 import os
 import random
@@ -25,7 +26,7 @@ from itertools import product
 
 import config
 from config import setup_logging
-from url_generator import generate_all_search_urls
+from url_generator import generate_search_url_for_page
 from google_scraper import load_proxies, scrape_google_page
 from website_extractor import extract_website_content
 from ai_extractor import extract_business_data, save_content_cache
@@ -36,6 +37,65 @@ _csv_lock = threading.Lock()
 
 # Event set on Ctrl+C — workers check before starting new work
 _shutdown_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Hourly memory cleanup — runs in a daemon thread alongside the workers.
+# Frees OS page cache (drop_caches=1) and Python GC objects without ever
+# touching running browser processes or their memory mappings.
+# Orphaned Chrome processes (ppid=1, meaning their parent already died) are
+# also reaped so they don't accumulate across long runs.
+# ---------------------------------------------------------------------------
+_MEM_CLEANUP_INTERVAL = 3600  # seconds (1 hour)
+
+
+def _memory_cleanup_loop(logger: logging.Logger):
+    """Background daemon that cleans up memory every hour."""
+    while not _shutdown_event.wait(timeout=_MEM_CLEANUP_INTERVAL):
+        try:
+            # 1. Force Python garbage collection
+            gc_collected = gc.collect()
+
+            # 2. Drop Linux page/dentry/inode cache — safe for running processes.
+            #    Write directly via Python to avoid any shell/binary dependency.
+            drop_ok = False
+            try:
+                subprocess.run(["/bin/sync"], capture_output=True)
+                with open("/proc/sys/vm/drop_caches", "w") as _f:
+                    _f.write("1\n")
+                drop_ok = True
+            except Exception as _e:
+                logger.warning(f"[MemClean] drop_caches failed: {_e}")
+
+            # 3. Reap orphaned Chrome/Chromedriver zombies (ppid=1 only).
+            #    Active workers own their browser children — their ppid is the
+            #    main Python process, NOT 1, so they are never touched here.
+            killed_orphans = 0
+            try:
+                ps_result = subprocess.run(
+                    ["/bin/ps", "-eo", "ppid,pid,comm"],
+                    capture_output=True, text=True,
+                )
+                import signal as _signal
+                for line in ps_result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0] == "1":
+                        comm = parts[2]
+                        if "chrome" in comm or "chromedriver" in comm:
+                            try:
+                                os.kill(int(parts[1]), _signal.SIGKILL)
+                                killed_orphans += 1
+                            except (ProcessLookupError, PermissionError):
+                                pass
+            except Exception as _e:
+                logger.warning(f"[MemClean] orphan reap failed: {_e}")
+
+            logger.info(
+                f"[MemClean] GC freed {gc_collected} objects | "
+                f"drop_caches={'OK' if drop_ok else 'FAILED'} | "
+                f"orphan chrome killed={killed_orphans}"
+            )
+        except Exception as e:
+            logger.warning(f"[MemClean] Error during cleanup: {e}")
 
 
 def read_input_csv(filepath: str) -> tuple:
@@ -98,6 +158,7 @@ def append_to_output_csv(filepath: str, data: dict, keyword: str, location: str,
         "address": data.get("address", ""),
         "business_city": data.get("business_city", ""),
         "business_state": data.get("business_state", ""),
+        "supply_location": data.get("supply_location", ""),
         "logo_url": data.get("logo_url", ""),
     }
     with _csv_lock:
@@ -241,6 +302,13 @@ def main():
     logger.info(f"Google Search Web Scraper - Starting ({num_workers} workers)")
     logger.info("=" * 60)
 
+    # Start hourly memory cleanup daemon thread
+    mem_cleaner = threading.Thread(
+        target=_memory_cleanup_loop, args=(logger,), daemon=True, name="mem-cleaner"
+    )
+    mem_cleaner.start()
+    logger.info(f"Memory cleanup thread started (interval: {_MEM_CLEANUP_INTERVAL}s)")
+
     # Kill only orphaned Chrome/Chromedriver processes left by a previous HVAC run.
     # Orphaned = parent PID is 1 (systemd/init), meaning their parent already died.
     # This avoids killing Chrome processes belonging to other apps on this server.
@@ -325,7 +393,7 @@ def main():
                 if tracker.is_combo_completed(keyword, location, page_idx):
                     yield None
                     continue
-                search_url = generate_all_search_urls(keyword, location, max_pages=max_pages)[page_idx]
+                search_url = generate_search_url_for_page(keyword, location, page_idx)
                 yield (keyword, location, page_idx, search_url)
 
     try:
@@ -398,6 +466,54 @@ def main():
         save_content_cache()
         signal.signal(signal.SIGINT, original_sigint)
 
+    # -----------------------------------------------------------------------
+    # Second pass: retry all failed (blocked) combos from this run
+    # -----------------------------------------------------------------------
+    if not _shutdown_event.is_set():
+        with tracker._lock:
+            failed_keys = set(tracker.state["failed_combos"])
+
+        if failed_keys:
+            logger.info("=" * 60)
+            logger.info(f"[Retry Pass] Retrying {len(failed_keys)} previously blocked combo(s)...")
+            logger.info("=" * 60)
+
+            retry_futures = {}
+            try:
+                with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="retry") as retry_exec:
+                    for key in failed_keys:
+                        if _shutdown_event.is_set():
+                            break
+                        try:
+                            kw, loc, pg_str = key.split("||")
+                            pg = int(pg_str)
+                        except ValueError:
+                            logger.warning(f"[Retry Pass] Could not parse failed key: {key}")
+                            continue
+                        # Clear from failed set so it can be properly completed or re-failed
+                        tracker.clear_failed_combo(kw, loc, pg)
+                        search_url = generate_search_url_for_page(kw, loc, pg)
+                        f = retry_exec.submit(
+                            worker_process_combo,
+                            kw, loc, pg, search_url,
+                            proxies, tracker, logger,
+                        )
+                        retry_futures[f] = (kw, loc, pg)
+
+                    for f in as_completed(retry_futures):
+                        wu_done = retry_futures[f]
+                        try:
+                            result = f.result()
+                            logger.info(f"[Retry Pass] {result}")
+                        except Exception as e:
+                            logger.error(
+                                f"[Retry Pass] Exception {wu_done[0]}|{wu_done[1]}|p{wu_done[2]}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+            finally:
+                tracker.flush()
+                save_content_cache()
+
     logger.info("=" * 60)
     if _shutdown_event.is_set():
         logger.info(
@@ -420,8 +536,12 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.ERROR)
         logging.error(f"FATAL CRASH: {type(e).__name__}: {e}")
         logging.error(traceback.format_exc())
-        # Also write to a crash file for post-mortem
-        with open("crash.log", "a", encoding="utf-8") as f:
+        # Also write to a crash file for post-mortem (absolute path so it
+        # always lands next to the project, not the cwd of the invoker).
+        crash_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "crash.log"
+        )
+        with open(crash_log_path, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*60}\n")
             f.write(f"FATAL CRASH at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(traceback.format_exc())

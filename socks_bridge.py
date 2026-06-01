@@ -30,6 +30,9 @@ class Socks5Bridge:
         self._thread = None
         self.port = None
         self._stop_event = threading.Event()
+        # Tracks how many connections failed due to SOCKS5 auth rejection
+        self.auth_failure_count = 0
+        self._count_lock = threading.Lock()
 
     def start(self):
         """Start the local bridge proxy. Returns the local port."""
@@ -161,6 +164,10 @@ class Socks5Bridge:
             s.connect((host, port))
             return s
         except Exception as e:
+            err_str = str(e).lower()
+            if "authentication" in err_str or "auth" in err_str:
+                with self._count_lock:
+                    self.auth_failure_count += 1
             logger.debug(f"SOCKS5 connect to {host}:{port} failed: {e}")
             return None
 

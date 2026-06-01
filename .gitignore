@@ -26,3 +26,31 @@ get-pip.py
 # OS
 Thumbs.db
 .DS_Store
+
+# --- review scraper: secrets, large datasets, and runtime artifacts ---
+
+# Proxy credential backups (proxies.txt itself is ignored above; .bak.<date> are not)
+proxies.txt.bak*
+
+# Yelp academic open dataset (~2.8GB) and other bulk datasets
+review/yelp_dataset/
+
+# Harvest / inspection scratch output (HTML, screenshots, dumps)
+review/_harvest/
+review/_harvest_v2/
+review/_inspect_out/
+
+# Logs, temp files, DB dumps, backups
+*.log
+*.tmp
+*.dump
+*.bak
+*.bak.*
+
+# Data outputs, caches, and progress files
+*_progress.json
+hvac_companies_cleaned.csv
+review/*.csv
+
+# Local agent/editor settings
+.claude/settings.local.json

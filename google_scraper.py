@@ -8,12 +8,36 @@ import random
 import time
 import logging
 import multiprocessing
+import glob
+import os
 from urllib.parse import urlparse
 
 from seleniumbase import SB
 
 import config
 from socks_bridge import Socks5Bridge
+
+
+def _find_chrome_binary():
+    """Find the Chrome binary in the Selenium cache or system paths."""
+    patterns = [
+        # SeleniumBase's own chrome-for-testing install (most reliable on this server)
+        '/usr/local/lib/python3.12/dist-packages/seleniumbase/drivers/chrome-linux64/chrome',
+        os.path.expanduser('~/.cache/selenium/chrome/linux64/*/chrome'),
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+    ]
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        for match in matches:
+            # Skip zero-byte or non-executable placeholders
+            if os.path.isfile(match) and os.path.getsize(match) > 1024:
+                return match
+    return None
+
+_CHROME_BINARY = _find_chrome_binary()
 
 logger = logging.getLogger("scraper")
 
@@ -123,11 +147,17 @@ def is_excluded_url(url: str) -> bool:
             "/en-au/", "/en-ca/", "/en-in/",
         )
         for seg in foreign_path_segments:
-            if path.startswith(seg) or f"{seg}" in path:
+            if seg in path:
                 return True
 
+        # Match excluded domains by exact equality or proper subdomain only
+        # (e.g. "x.com" must match "x.com" or "*.x.com", not "abcx.com").
+        # The leading "." entries (".gov") still match suffixes correctly.
         for excluded in config.EXCLUDED_DOMAINS:
-            if excluded in domain:
+            if excluded.startswith("."):
+                if domain.endswith(excluded):
+                    return True
+            elif domain == excluded or domain.endswith("." + excluded):
                 return True
     except Exception:
         return True
@@ -244,6 +274,24 @@ def _extract_urls_from_page(sb) -> list:
     return found_urls
 
 
+# Randomised Chrome user-agents (Windows/Mac/Linux, Chrome 122-124)
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+
+# Randomised window sizes to avoid uniform fingerprinting across workers
+_WINDOW_SIZES = [
+    (1280, 720), (1280, 800), (1366, 768), (1440, 900),
+    (1536, 864), (1600, 900), (1920, 1080),
+]
+
 # Strings that indicate Google is blocking us (CAPTCHA / unusual traffic)
 _BLOCK_SIGNALS = [
     "unusual traffic",
@@ -296,46 +344,91 @@ def _scrape_worker(search_url: str, proxy_str: str, result_queue):
     Puts a dict on the queue:
         {"urls": [...], "blocked": True/False}
     """
+    # Stagger startup so 20 concurrent workers don't all hit Google at the
+    # exact same millisecond — a strong bot-traffic signal.
+    time.sleep(random.uniform(0, 10))
+
     result = {"urls": [], "blocked": False}
+    # Defined BEFORE the outer try so the cleanup block at the end can always
+    # reference it — even if the try body throws before assigning to it.
+    virtual_display = None
     try:
+        w, h = random.choice(_WINDOW_SIZES)
+        user_agent = random.choice(_USER_AGENTS)
+
+        # Build chromium_arg — comma-separated list as SeleniumBase expects
+        chromium_args = [
+            "--no-sandbox",                    # required when running as root on Linux
+            "--disable-dev-shm-usage",         # avoids /dev/shm OOM in containers
+            "--disable-gpu",                   # headless stability on Linux servers
+            "--disable-software-rasterizer",   # reduces CPU on virtual display
+            f"--window-size={w},{h}",          # randomise viewport fingerprint
+            "--disable-blink-features=AutomationControlled",  # hide automation flag
+        ]
+
+        # Pre-start an Xvfb virtual display so that when SeleniumBase's UC mode
+        # init tries to import PyAutoGUI, os.environ['DISPLAY'] is already set.
+        # Without this, mouseinfo crashes on import with KeyError:'DISPLAY',
+        # SeleniumBase fails to detect PyAutoGUI, and uc_open_with_reconnect hangs.
+        try:
+            from sbvirtualdisplay import Display
+            virtual_display = Display(visible=0, size=(1920, 1080))
+            virtual_display.start()
+        except Exception:
+            pass
+
         sb_kwargs = {
-            "uc": True,
-            "headless2": False,
+            "uc": True,            # undetected-chromedriver mode (patches navigator.webdriver)
+            "headless": False,     # headed mode on virtual display — UC mode requires a display
+            "incognito": True,     # fresh cookie/storage state per session
+            "driver_version": "147",           # pin to installed Chrome 147
+            "chromium_arg": ",".join(chromium_args),
+            "agent": user_agent,
         }
+
+        if _CHROME_BINARY:
+            sb_kwargs["binary_location"] = _CHROME_BINARY
 
         if proxy_str:
             sb_kwargs["proxy"] = proxy_str
 
         with SB(**sb_kwargs) as sb:
-            # Native Selenium timeouts to prevent sb.open() from hanging
+            # Short page load timeout — fail fast and let the 180s hard kill
+            # handle truly hung Chrome processes.
             try:
-                sb.driver.set_page_load_timeout(80)
-                sb.driver.set_script_timeout(80)
+                sb.driver.set_page_load_timeout(30)
+                sb.driver.set_script_timeout(30)
             except Exception:
                 pass
 
-            # Use uc_open_with_reconnect to handle Google CAPTCHAs
+            # Randomise reconnect time: during disconnect ChromeDriver is
+            # detached so Google's JS sees a real user browsing.
+            reconnect_time = random.uniform(7, 12)
+
             try:
-                sb.uc_open_with_reconnect(search_url, reconnect_time=6)
+                sb.uc_open_with_reconnect(search_url, reconnect_time=reconnect_time)
             except Exception:
-                # Fallback to regular open if UC reconnect fails
                 sb.open(search_url)
 
-            time.sleep(random.uniform(3, 5))
+            # 8–12s wait mirrors what the reference SERP scraper uses —
+            # long enough for JS-heavy pages to fully render.
+            time.sleep(random.uniform(8, 12))
 
-            # Try to solve CAPTCHA if Google shows one
-            if _detect_google_block(sb):
-                try:
-                    sb.uc_gui_click_captcha()
-                    time.sleep(random.uniform(3, 5))
-                except Exception:
-                    pass
-
-            # Check again after CAPTCHA attempt
+            # Check if Google is blocking us (CAPTCHA / unusual-traffic page).
+            # If blocked, mark for retry — uc_gui_handle_captcha() could be
+            # added here if needed (requires PyAutoGUI + working Xvfb display).
             if _detect_google_block(sb):
                 result["blocked"] = True
                 result_queue.put(result)
                 return
+
+            # Human-like scroll — real users scroll to see results
+            try:
+                scroll_y = random.randint(200, 500)
+                sb.execute_script(f"window.scrollBy(0, {scroll_y});")
+                time.sleep(random.uniform(0.5, 1.5))
+            except Exception:
+                pass
 
             # Wait for search results to load
             for wait_sel in ["div#search", "#rso", "#rso > div a h3"]:
@@ -350,14 +443,23 @@ def _scrape_worker(search_url: str, proxy_str: str, result_queue):
     except Exception:
         pass
 
+    # Stop the virtual display when done
+    if virtual_display is not None:
+        try:
+            virtual_display.stop()
+        except Exception:
+            pass
+
     try:
         result_queue.put(result)
     except Exception:
         pass
 
 
-# Hard timeout for each Google scraping attempt (seconds)
-_SCRAPE_TIMEOUT = 150
+# Hard timeout for each Google scraping attempt (seconds).
+# Increased from 150 to account for the 0-10s worker stagger and
+# longer reconnect_time (up to 12s) added for better undetection.
+_SCRAPE_TIMEOUT = 180
 _MAX_RETRIES = 7
 # Backoff between retries (seconds): base * 2^attempt, capped at max
 _BACKOFF_BASE = 3
@@ -391,6 +493,11 @@ def scrape_google_page(search_url: str, proxies: list) -> dict:
     blocked_count = 0
 
     for attempt in range(_MAX_RETRIES):
+        # Stagger the first attempt per-combo so workers don't all fire
+        # simultaneously at the start of each retry cycle.
+        if attempt == 0:
+            time.sleep(random.uniform(0, 5))
+
         proxy = get_random_proxy(proxies)
         bridge = None
 
@@ -429,6 +536,7 @@ def scrape_google_page(search_url: str, proxies: list) -> dict:
             proc.join(timeout=_SCRAPE_TIMEOUT)
 
             if proc.is_alive():
+                blocked_count += 1
                 logger.warning(
                     f"Google scrape timed out after {_SCRAPE_TIMEOUT}s "
                     f"(attempt {attempt + 1}/{_MAX_RETRIES}), killing & retrying"
@@ -455,6 +563,24 @@ def scrape_google_page(search_url: str, proxies: list) -> dict:
                 logger.warning(
                     f"BLOCKED by Google (CAPTCHA/unusual traffic) on "
                     f"attempt {attempt + 1}/{_MAX_RETRIES} — rotating proxy"
+                )
+                backoff = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+                logger.info(f"Backing off {backoff}s before retry")
+                time.sleep(backoff)
+                continue
+
+            # --- SOCKS5 auth failure? Treat as blocked, rotate proxy ---
+            # When SOCKS5 credentials are rejected the bridge returns 502 for
+            # every connection, Chrome loads nothing, and the worker returns
+            # empty URLs with blocked=False.  Detect this via the bridge's
+            # auth_failure_count so we retry with a different proxy instead of
+            # wrongly marking the combo as completed with no results.
+            if bridge and bridge.auth_failure_count > 0:
+                blocked_count += 1
+                logger.warning(
+                    f"SOCKS5 proxy authentication failed ({bridge.auth_failure_count} "
+                    f"connections rejected) on attempt {attempt + 1}/{_MAX_RETRIES} "
+                    f"— rotating proxy"
                 )
                 backoff = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
                 logger.info(f"Backing off {backoff}s before retry")

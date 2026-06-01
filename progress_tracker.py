@@ -264,6 +264,7 @@ class ProgressTracker:
                 "completed_combos": set(),
                 "processed_urls": set(),
                 "failed_combos": set(),
+                "processed_domains": set(),
             }
             self._force_save()
         logger.info("Progress has been reset.")
